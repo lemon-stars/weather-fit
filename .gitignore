@@ -11,4 +11,7 @@ pnpm-debug.log*
 # Editor
 .vscode/
 .idea/
+.env
+.env.*
+!.env.example
 

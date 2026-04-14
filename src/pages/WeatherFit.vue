@@ -8,6 +8,7 @@
           <span class="weather__value">{{ weatherText }}</span>
         </div>
         <div class="tip">{{ outfitTip }}</div>
+        <div v-if="classifyTip" class="tip tip--muted">{{ classifyTip }}</div>
       </div>
 
       <div class="top__right">
@@ -37,9 +38,36 @@
 
     <section class="bottom">
       <template v-if="activeTab === 'home'">
-        <div class="sectionTitle">今日推荐搭配</div>
+        <div class="sectionHeader">
+          <div class="sectionTitle">今日推荐搭配</div>
+          <div class="headerActions">
+            <button
+              type="button"
+              class="switchBtn"
+              :disabled="generatingOutfitImage || recommendationCards.length === 0"
+              @click="generateOutfitImage"
+            >
+              {{ generatingOutfitImage ? '生成中...' : '生成搭配图' }}
+            </button>
+            <button
+              v-if="outfitCandidates.length > 1"
+              type="button"
+              class="switchBtn"
+              @click="switchOutfit"
+            >
+              换一套（{{ activeCandidateIndex + 1 }}/{{ outfitCandidates.length }}）
+            </button>
+          </div>
+        </div>
+        <div v-if="outfitImageTip" class="tip tip--muted">{{ outfitImageTip }}</div>
+        <div v-if="generatedOutfitImageUrl" class="preview" aria-label="生成的搭配合成图">
+          <img class="preview__img" :src="generatedOutfitImageUrl" alt="AI 生成搭配图" />
+        </div>
+        <div v-if="recommendationCards.length === 0" class="emptyRecommendation">
+          请至少上传上衣、下装、鞋子各一张，系统会自动搭配，帽子和配饰可选
+        </div>
         <div class="grid" role="list">
-          <div v-for="item in recommendations" :key="item.id" class="card" role="listitem">
+          <div v-for="item in recommendationCards" :key="item.id" class="card" role="listitem">
             <div class="card__imgWrap">
               <img v-if="item.imageUrl" class="card__img" :src="item.imageUrl" :alt="item.title" />
               <div v-else class="card__placeholder" aria-hidden="true" />
@@ -48,7 +76,7 @@
           </div>
         </div>
       </template>
-      <MyWardrobe v-else :images="wardrobeImages" />
+      <MyWardrobe v-else :items="wardrobeItems" @update-item="onUpdateWardrobeItem" />
     </section>
 
     <nav class="tabbar" aria-label="底部导航">
@@ -73,8 +101,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import MyWardrobe from '../components/MyWardrobe.vue';
+import { buildOutfitCandidates, inferWardrobeItem, type WardrobeItem, warmthByCategory } from '../utils/outfitEngine';
+import { classifyClothingWithDashscope } from '../utils/visionClassifier';
+import { generateOutfitCompositeImage } from '../utils/outfitImageComposer';
 
 type Recommendation = {
   id: string;
@@ -85,41 +116,147 @@ type Recommendation = {
 const city = ref('成都');
 const weatherText = ref('正在获取温度...');
 const outfitTip = ref('正在生成穿衣建议...');
+const classifyTip = ref('');
+const outfitImageTip = ref('');
+const generatedOutfitImageUrl = ref('');
+const generatingOutfitImage = ref(false);
 
 const DEFAULT_LNG = 104.06;
 const DEFAULT_LAT = 30.67;
 const activeTab = ref<'home' | 'wardrobe'>('home');
+const currentTemperature = ref<number | null>(null);
+const activeCandidateIndex = ref(0);
 
 const fileInputRef = ref<HTMLInputElement | null>(null);
-const wardrobeImages = ref<string[]>([]);
+const wardrobeItems = ref<WardrobeItem[]>([]);
 
 const latestImageUrl = computed(() => {
-  const lastIndex = wardrobeImages.value.length - 1;
-  return lastIndex >= 0 ? wardrobeImages.value[lastIndex] : null;
+  const lastIndex = wardrobeItems.value.length - 1;
+  return lastIndex >= 0 ? wardrobeItems.value[lastIndex].imageUrl : null;
 });
 
-const recommendations = ref<Recommendation[]>([
-  { id: '1', title: '简约通勤 · 白衬衫 + 牛仔裤' },
-  { id: '2', title: '春日清爽 · 卫衣 + 休闲裤' },
-  { id: '3', title: '轻户外 · 风衣 + 运动鞋' },
-  { id: '4', title: '约会氛围 · 针织 + 半裙' },
-  { id: '5', title: '周末出游 · T 恤 + 短裤' },
-  { id: '6', title: '高级感 · 西装外套 + 阔腿裤' },
-]);
+const outfitCandidates = computed(() => {
+  if (wardrobeItems.value.length === 0) return [];
+  const temp = currentTemperature.value ?? 22;
+  return buildOutfitCandidates(wardrobeItems.value, temp);
+});
+
+const recommendationCards = computed<Recommendation[]>(() => {
+  const current = outfitCandidates.value[activeCandidateIndex.value];
+  if (!current) return [];
+  return current.items.map((item) => ({
+    id: item.id,
+    title: item.name,
+    imageUrl: item.imageUrl,
+  }));
+});
+
+const activeOutfitItems = computed<WardrobeItem[]>(() => {
+  const current = outfitCandidates.value[activeCandidateIndex.value];
+  return current?.items ?? [];
+});
 
 function pickImage() {
   fileInputRef.value?.click();
 }
 
-function onPickImage(e: Event) {
+async function onPickImage(e: Event) {
   const input = e.target as HTMLInputElement | null;
   const files = input?.files ? Array.from(input.files) : [];
-  const newUrls = files.map((file) => URL.createObjectURL(file));
-  if (newUrls.length > 0) {
-    wardrobeImages.value.push(...newUrls);
+  if (files.length === 0) return;
+
+  classifyTip.value = '正在识别图片内容...';
+  let firstVisionError = '';
+  const newItems = await Promise.all(
+    files.map(async (file) => {
+      const imageUrl = URL.createObjectURL(file);
+      try {
+        const visionResult = await classifyClothingWithDashscope(file);
+        if (visionResult) {
+          const item = inferWardrobeItem(file.name, imageUrl, {
+            category: visionResult.category,
+            style: visionResult.style,
+            colorTone: visionResult.colorTone,
+          });
+          item.confidence = visionResult.confidence;
+          item.source = 'dashscope';
+          return item;
+        }
+      } catch (error) {
+        if (!firstVisionError) {
+          firstVisionError = error instanceof Error ? error.message : String(error);
+        }
+      }
+
+      const fallback = inferWardrobeItem(file.name, imageUrl);
+      fallback.confidence = 0;
+      fallback.source = 'local';
+      return fallback;
+    }),
+  );
+
+  if (newItems.length > 0) {
+    wardrobeItems.value.push(...newItems);
+  }
+  const modelTaggedCount = newItems.filter((item) => item.source === 'dashscope').length;
+  if (modelTaggedCount > 0) {
+    classifyTip.value = `已用百炼识别 ${modelTaggedCount}/${newItems.length} 张图片`;
+  } else if (firstVisionError.includes('Access to model denied')) {
+    classifyTip.value = '百炼返回模型无权限，请在控制台开通当前模型或更换可用模型';
+  } else if (firstVisionError) {
+    classifyTip.value = `百炼识别失败，已回退本地规则：${firstVisionError}`;
+  } else {
+    classifyTip.value = '未检测到百炼配置，已使用本地规则识别';
   }
 
   if (input) input.value = '';
+}
+
+function onUpdateWardrobeItem(payload: {
+  id: string;
+  field: 'category' | 'style' | 'colorTone';
+  value: string;
+}) {
+  const target = wardrobeItems.value.find((item) => item.id === payload.id);
+  if (!target) return;
+
+  if (payload.field === 'category') {
+    target.category = payload.value as WardrobeItem['category'];
+    target.warmth = warmthByCategory[target.category];
+    return;
+  }
+
+  if (payload.field === 'style') target.style = payload.value as WardrobeItem['style'];
+  if (payload.field === 'colorTone') target.colorTone = payload.value as WardrobeItem['colorTone'];
+}
+
+function switchOutfit() {
+  if (outfitCandidates.value.length <= 1) return;
+  activeCandidateIndex.value =
+    (activeCandidateIndex.value + 1) % outfitCandidates.value.length;
+  generatedOutfitImageUrl.value = '';
+  outfitImageTip.value = '';
+}
+
+async function generateOutfitImage() {
+  if (activeOutfitItems.value.length === 0 || generatingOutfitImage.value) return;
+
+  generatingOutfitImage.value = true;
+  outfitImageTip.value = '正在生成搭配合成图...';
+  try {
+    const imageUrl = await generateOutfitCompositeImage(activeOutfitItems.value);
+    if (imageUrl) {
+      generatedOutfitImageUrl.value = imageUrl;
+      outfitImageTip.value = '已生成搭配图';
+    } else {
+      outfitImageTip.value = '当前搭配缺少上衣/下装/鞋子，无法合成';
+    }
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    outfitImageTip.value = `合成失败：${msg}`;
+  } finally {
+    generatingOutfitImage.value = false;
+  }
 }
 
 function getOutfitTipByTemperature(temp: number): string {
@@ -213,9 +350,11 @@ async function loadWeather() {
     const temperature = data.current?.temperature_2m;
     if (typeof temperature !== 'number') throw new Error('Invalid response payload');
 
+    currentTemperature.value = temperature;
     weatherText.value = `${temperature.toFixed(1)}°C`;
     outfitTip.value = getOutfitTipByTemperature(temperature);
   } catch {
+    currentTemperature.value = null;
     weatherText.value = '温度获取失败';
     outfitTip.value = '暂时无法获取天气，建议按体感穿搭';
   }
@@ -225,8 +364,16 @@ onMounted(() => {
   loadWeather();
 });
 
+watch(outfitCandidates, () => {
+  if (activeCandidateIndex.value >= outfitCandidates.value.length) {
+    activeCandidateIndex.value = 0;
+  }
+  generatedOutfitImageUrl.value = '';
+  outfitImageTip.value = '';
+});
+
 onBeforeUnmount(() => {
-  wardrobeImages.value.forEach((url) => URL.revokeObjectURL(url));
+  wardrobeItems.value.forEach((item) => URL.revokeObjectURL(item.imageUrl));
 });
 </script>
 
@@ -282,6 +429,10 @@ onBeforeUnmount(() => {
 .tip {
   font-size: 12px;
   opacity: 0.9;
+}
+
+.tip--muted {
+  opacity: 0.75;
 }
 
 .badge {
@@ -376,6 +527,41 @@ onBeforeUnmount(() => {
   font-size: 14px;
   font-weight: 800;
   letter-spacing: 0.2px;
+}
+
+.sectionHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.headerActions {
+  display: flex;
+  gap: 8px;
+}
+
+.switchBtn {
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(125, 224, 255, 0.4);
+  background: rgba(93, 153, 255, 0.2);
+  color: inherit;
+  font-size: 12px;
+}
+
+.switchBtn:disabled {
+  opacity: 0.55;
+}
+
+.emptyRecommendation {
+  padding: 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.05);
+  font-size: 12px;
+  opacity: 0.9;
 }
 
 .grid {
